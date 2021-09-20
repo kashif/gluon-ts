@@ -83,7 +83,7 @@ class Rotation(nn.Module):
         return flip.reshape(x.shape[0], 1, x.shape[2]) * x[:, :, rotate_axis]
 
 
-class Permuation(nn.Module):
+class Permutation(nn.Module):
     def __init__(self, p, max_segments=5, seg_mode="equal"):
         super().__init__()
         self.p = p
@@ -141,14 +141,17 @@ class MagnitudeWarp(nn.Module):
 
         ret = torch.zeros_like(x)
         for i, pat in enumerate(x):
-            warper = np.array(
-                [
-                    CubicSpline(warp_steps[:, dim], random_warps[i, :, dim])(
-                        orig_steps
-                    )
-                    for dim in range(x.shape[2])
-                ]
-            ).T
+            try:
+                warper = np.array(
+                    [
+                        CubicSpline(warp_steps[:, dim], random_warps[i, :, dim])(
+                            orig_steps
+                        )
+                        for dim in range(x.shape[2])
+                    ]
+                ).T
+            except:
+                return x
 
             ret[i] = pat * torch.from_numpy(warper).float().to(x.device)
 
@@ -181,10 +184,13 @@ class TimeWrap(nn.Module):
         ret = torch.zeros_like(x)
         for i, pat in enumerate(x):
             for dim in range(x.shape[2]):
-                time_warp = CubicSpline(
-                    warp_steps[:, dim],
-                    warp_steps[:, dim] * random_warps[i, :, dim],
-                )(orig_steps)
+                try:
+                    time_warp = CubicSpline(
+                        warp_steps[:, dim],
+                        warp_steps[:, dim] * random_warps[i, :, dim],
+                    )(orig_steps)
+                except:
+                    return x
                 scale = (x.shape[1] - 1) / time_warp[-1]
                 wrap = np.interp(
                     orig_steps,
@@ -245,9 +251,12 @@ class WindowWarp(nn.Module):
         warp_size = np.ceil(self.window_ratio * x.shape[1]).astype(int)
         window_steps = np.arange(warp_size)
 
-        window_starts = np.random.randint(
-            low=1, high=x.shape[1] - warp_size - 1, size=(x.shape[0])
-        ).astype(int)
+        try:
+            window_starts = np.random.randint(
+                low=1, high=x.shape[1] - warp_size - 1, size=(x.shape[0])
+            ).astype(int)
+        except:
+            return x
         window_ends = (window_starts + warp_size).astype(int)
 
         ret = torch.zeros_like(x)

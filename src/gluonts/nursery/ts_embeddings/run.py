@@ -18,12 +18,13 @@ import os
 from argparse import ArgumentParser
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from gluonts.nursery.ts_embeddings.embed_model import EmbedModel
+from gluonts.dataset.field_names import FieldName
 
 
 class MyDataModule(pl.LightningDataModule):
@@ -55,22 +56,27 @@ class MyDataModule(pl.LightningDataModule):
         parser.add_argument("--batch_size", type=int, default=128)
         return parser
 
-    def _get_target_tensor(self, it):
+    def _get_target_tensor(self, it, prediction_length=0):
         data = []
+        feat_cat = []
         n_skipped = 0
         for ts in it:
-            target = ts["target"]
-            if len(target) < self.ts_len:
+            target = ts[FieldName.TARGET]
+            if len(target) < self.ts_len + prediction_length:
                 n_skipped += 1
                 continue
-            data.append(target[: self.ts_len])
+            if prediction_length > 0:
+                data.append(target[-self.ts_len:])
+            else:
+                data.append(target[: self.ts_len])
+            feat_cat.append(ts[FieldName.FEAT_STATIC_CAT])
         if n_skipped > 0:
             print(
                 f"skipped {n_skipped} series, because the target was smaller than ts_len={self.ts_len}"
             )
         print(f"num series {len(data)}")
         assert len(data) > 0
-        return torch.tensor(data, dtype=torch.float32)
+        return torch.tensor(data, dtype=torch.float32), torch.tensor(feat_cat, dtype=torch.long)
 
     def setup(self, stage=None):
         if self.dataset_name:
@@ -94,7 +100,8 @@ class MyDataModule(pl.LightningDataModule):
                     Path(self.dataset_name), freq="10min"
                 )
                 # self.X_train = self._get_target_tensor(self.train_ds)
-            X_train = self._get_target_tensor(self.train_ds)
+            X_train, self.X_cat_feat = self._get_target_tensor(self.train_ds)
+            X_test, _ = self._get_target_tensor(self.test_ds, prediction_length=self.meta.prediction_length)
 
             num_ts = X_train.shape[0]
             first_dim = int(num_ts / self.multivar_dim)
@@ -107,8 +114,10 @@ class MyDataModule(pl.LightningDataModule):
 
             if self.multivar_dim > 1:
                 self.X_train = X_train.reshape(first_dim, self.multivar_dim, T)
+                self.X_test = X_test.reshape(first_dim, self.multivar_dim, T)
             else:
                 self.X_train = X_train.unsqueeze(dim=1)
+                self.X_test = X_test.unsqueeze(dim=1)
 
             print(
                 f"Shape of the tensor: {self.X_train.shape} and we have {num_ts} time series of length {T}."
@@ -116,8 +125,7 @@ class MyDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(
-            # TensorDataset(torch.tensor(self.X_train)),
-            self.X_train,
+            TensorDataset(self.X_train, self.X_cat_feat),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=self.shuffle,
@@ -127,11 +135,11 @@ class MyDataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(
-            # TensorDataset(torch.tensor(self.X_train)),
-            self.X_train,
+            TensorDataset(self.X_test, self.X_cat_feat),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=False,
+            drop_last=True,
         )
 
 
@@ -181,7 +189,7 @@ if __name__ == "__main__":
     trainer.fit(model, data_module)
     print("encoder training done")
 
-    for batch in data_module.train_dataloader():
+    for [batch, _] in data_module.train_dataloader():
         with torch.no_grad():
             encoder = torch.jit.trace(model, batch)
         break

@@ -17,7 +17,17 @@ import torch.nn.functional as F
 import numpy
 from typing import Optional, Any, Tuple
 
-from .pt_augmentation import RandomApply, Jitter, Scaling
+from .pt_augmentation import (
+    RandomApply,
+    Jitter,
+    Scaling,
+    Rotation,
+    Permutation,
+    MagnitudeWarp,
+    TimeWrap,
+    WindowSlice,
+    WindowWarp,
+)
 
 
 class NT_Xent_Loss(torch.nn.modules.loss._Loss):
@@ -38,7 +48,18 @@ class NT_Xent_Loss(torch.nn.modules.loss._Loss):
         if self.compared_length is None:
             self.compared_length = numpy.inf
         self.temperature = temperature
-        self.transformation = RandomApply([Jitter(p=0.5), Scaling(p=0.5)])
+        self.transformation = RandomApply(
+            [
+                Jitter(p=0.1),
+                Scaling(p=0.1),
+                Rotation(p=0.1),
+                Permutation(p=0.1),
+                MagnitudeWarp(p=0.1),
+                TimeWrap(p=0.1),
+                WindowSlice(p=0.1),
+                WindowWarp(p=0.1),
+            ]
+        )
 
     def get_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -141,6 +162,18 @@ class BarlowTwins(torch.nn.Module):
         self.lambd = lambd
         self.scale_loss = scale_loss
         self.bn = torch.nn.BatchNorm1d(out_channels, affine=False)
+        self.transformation = RandomApply(
+            [
+                Jitter(p=0.1),
+                Scaling(p=0.1),
+                Rotation(p=0.1),
+                Permutation(p=0.1),
+                MagnitudeWarp(p=0.1),
+                TimeWrap(p=0.1),
+                WindowSlice(p=0.1),
+                WindowWarp(p=0.1),
+            ]
+        )
 
     def get_representations(self, batch) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -171,29 +204,33 @@ class BarlowTwins(torch.nn.Module):
         end_positive = beginning_positive + length_pos_neg
 
         representation = self.encoder(
-            torch.cat(
-                [
-                    batch[
-                        j : j + 1,
-                        :,
-                        beginning_batches[j] : beginning_batches[j]
-                        + random_length,
+            self.transformation(
+                torch.cat(
+                    [
+                        batch[
+                            j : j + 1,
+                            :,
+                            beginning_batches[j] : beginning_batches[j]
+                            + random_length,
+                        ]
+                        for j in range(batch_size)
                     ]
-                    for j in range(batch_size)
-                ]
+                )
             )
         )  # Anchors representations
 
         positive_representation = self.encoder(
-            torch.cat(
-                [
-                    batch[
-                        j : j + 1,
-                        :,
-                        end_positive[j] - length_pos_neg : end_positive[j],
+            self.transformation(
+                torch.cat(
+                    [
+                        batch[
+                            j : j + 1,
+                            :,
+                            end_positive[j] - length_pos_neg : end_positive[j],
+                        ]
+                        for j in range(batch_size)
                     ]
-                    for j in range(batch_size)
-                ]
+                )
             )
         )  # Positive samples representations
 
@@ -248,6 +285,18 @@ class MoCo(torch.nn.Module):
         self.keys = keys
         self.momentum = momentum
         self.temperature = temperature
+        self.transformation = RandomApply(
+            [
+                Jitter(p=0.1),
+                Scaling(p=0.1),
+                Rotation(p=0.1),
+                Permutation(p=0.1),
+                MagnitudeWarp(p=0.1),
+                TimeWrap(p=0.1),
+                WindowSlice(p=0.1),
+                WindowWarp(p=0.1),
+            ]
+        )
 
         for param_q, param_k in zip(
             self.encoder_q.parameters(), self.encoder_k.parameters()
@@ -324,29 +373,33 @@ class MoCo(torch.nn.Module):
         end_positive = beginning_positive + length_pos_neg
 
         representation = self.encoder_q(
+            self.transformation(
+                torch.cat(
+                    [
+                        batch[
+                            j : j + 1,
+                            :,
+                            beginning_batches[j] : beginning_batches[j]
+                            + random_length,
+                        ]
+                        for j in range(batch_size)
+                    ]
+                )
+            )
+        )  # Anchors representations
+
+        positive_samples = self.transformation(
             torch.cat(
                 [
                     batch[
                         j : j + 1,
                         :,
-                        beginning_batches[j] : beginning_batches[j]
-                        + random_length,
+                        end_positive[j] - length_pos_neg : end_positive[j],
                     ]
                     for j in range(batch_size)
                 ]
-            )
-        )  # Anchors representations
-
-        positive_samples = torch.cat(
-            [
-                batch[
-                    j : j + 1,
-                    :,
-                    end_positive[j] - length_pos_neg : end_positive[j],
-                ]
-                for j in range(batch_size)
-            ]
-        )  # Positive samples
+            )  # Positive samples
+        )
 
         return representation, positive_samples
 

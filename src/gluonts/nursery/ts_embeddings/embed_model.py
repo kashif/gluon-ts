@@ -299,7 +299,8 @@ class EmbedModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # TODO: If the pre-processing is expensive, we may optionally want to run it
         #       on the whole training dataset before training
-        u = self.preprocess(batch)
+        x, _ = batch
+        u = self.preprocess(x)
         rep, sub_window_rep = self.loss.get_representations(u)
 
         loss = self.loss(rep, sub_window_rep)
