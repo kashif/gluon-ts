@@ -16,7 +16,6 @@ from typing import Callable, Dict, Optional, Tuple, Type
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import (
     Beta,
     Distribution,
@@ -30,6 +29,11 @@ from torch.distributions import (
 from gluonts.core.component import validated
 from gluonts.torch.modules.lambda_layer import LambdaLayer
 from gluonts.torch.distributions import AffineTransformed
+
+
+@torch.jit.script
+def squareplus(x: torch.Tensor) -> torch.Tensor:
+    return (x + torch.sqrt(x**2 + 4)) / 2
 
 
 class PtArgProj(nn.Module):
@@ -182,7 +186,7 @@ class NormalOutput(DistributionOutput):
 
     @classmethod
     def domain_map(cls, loc: torch.Tensor, scale: torch.Tensor):
-        scale = F.softplus(scale)
+        scale = squareplus(scale)
         return loc.squeeze(-1), scale.squeeze(-1)
 
     @property
@@ -198,8 +202,8 @@ class StudentTOutput(DistributionOutput):
     def domain_map(
         cls, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
     ):
-        scale = F.softplus(scale)
-        df = 2.0 + F.softplus(df)
+        scale = squareplus(scale)
+        df = 2.0 + squareplus(df)
         return df.squeeze(-1), loc.squeeze(-1), scale.squeeze(-1)
 
     @property
@@ -215,9 +219,8 @@ class BetaOutput(DistributionOutput):
     def domain_map(
         cls, concentration1: torch.Tensor, concentration0: torch.Tensor
     ):
-        epsilon = np.finfo(cls._dtype).eps  # machine epsilon
-        concentration1 = F.softplus(concentration1) + epsilon
-        concentration0 = F.softplus(concentration0) + epsilon
+        concentration1 = squareplus(concentration1)
+        concentration0 = squareplus(concentration0)
         return concentration1.squeeze(dim=-1), concentration0.squeeze(dim=-1)
 
     @property
@@ -235,9 +238,8 @@ class GammaOutput(DistributionOutput):
 
     @classmethod
     def domain_map(cls, concentration: torch.Tensor, rate: torch.Tensor):
-        epsilon = np.finfo(cls._dtype).eps  # machine epsilon
-        concentration = F.softplus(concentration) + epsilon
-        rate = F.softplus(rate) + epsilon
+        concentration = squareplus(concentration)
+        rate = squareplus(rate)
         return concentration.squeeze(dim=-1), rate.squeeze(dim=-1)
 
     @property
@@ -255,7 +257,7 @@ class PoissonOutput(DistributionOutput):
 
     @classmethod
     def domain_map(cls, rate: torch.Tensor):
-        rate_pos = F.softplus(rate).clone()
+        rate_pos = squareplus(rate).clone()
         return (rate_pos.squeeze(-1),)
 
     @property
@@ -269,7 +271,7 @@ class NegativeBinomialOutput(DistributionOutput):
 
     @classmethod
     def domain_map(cls, total_count: torch.Tensor, logits: torch.Tensor):
-        total_count = F.softplus(total_count)
+        total_count = squareplus(total_count)
         return total_count.squeeze(-1), logits.squeeze(-1)
 
     def _base_distribution(self, distr_args) -> Distribution:
