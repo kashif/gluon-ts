@@ -219,7 +219,7 @@ class MambaModel(nn.Module):
     def _past_length(self) -> int:
         return self.context_length + max(self.lags_seq)
 
-    def prepare_rnn_input(
+    def prepare_mamba_input(
         self,
         feat_static_cat: torch.Tensor,
         feat_static_real: torch.Tensor,
@@ -271,7 +271,7 @@ class MambaModel(nn.Module):
 
         return torch.cat((lags, features), dim=-1), scale, static_feat
 
-    def unroll_lagged_rnn(
+    def unroll_lagged_mamba(
         self,
         feat_static_cat: torch.Tensor,
         feat_static_real: torch.Tensor,
@@ -288,7 +288,7 @@ class MambaModel(nn.Module):
         Tuple[torch.Tensor, torch.Tensor],
     ]:
         """
-        Applies the underlying RNN to the provided target data and covariates.
+        Applies the underlying Mamba to the provided target data and covariates.
 
         Parameters
         ----------
@@ -324,7 +324,7 @@ class MambaModel(nn.Module):
             - Static input to the RNN
             - Output state from the RNN
         """
-        rnn_input, scale, static_feat = self.prepare_rnn_input(
+        mamba_input, scale, static_feat = self.prepare_mamba_input(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
@@ -334,10 +334,10 @@ class MambaModel(nn.Module):
             future_target,
         )
 
-        output, new_state = self.rnn(rnn_input)
+        output = self.mamba(mamba_input)
 
         params = self.param_proj(output)
-        return params, scale, output, static_feat, new_state
+        return params, scale, output, static_feat
 
     @torch.jit.ignore
     def output_distribution(
@@ -424,7 +424,7 @@ class MambaModel(nn.Module):
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
 
-        params, scale, _, static_feat, state = self.unroll_lagged_rnn(
+        params, scale, _, static_feat = self.unroll_lagged_mamba(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
@@ -446,10 +446,10 @@ class MambaModel(nn.Module):
         repeated_time_feat = future_time_feat.repeat_interleave(
             repeats=num_parallel_samples, dim=0
         )
-        repeated_state = [
-            s.repeat_interleave(repeats=num_parallel_samples, dim=1)
-            for s in state
-        ]
+        # repeated_state = [
+        #     s.repeat_interleave(repeats=num_parallel_samples, dim=1)
+        #     for s in state
+        # ]
 
         repeated_params = [
             s.repeat_interleave(repeats=num_parallel_samples, dim=0)
@@ -554,7 +554,7 @@ class MambaModel(nn.Module):
             *future_observed_values.shape[extra_dims + 1 :],
         )
 
-        params, scale, _, _, _ = self.unroll_lagged_rnn(
+        params, scale, _, _ = self.unroll_lagged_mamba(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
