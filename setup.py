@@ -58,7 +58,8 @@ class TypeCheckCommand(distutils.cmd.Command):
         import mypy.api
 
         excluded_folders = [
-            str(p.parent.relative_to(ROOT)) for p in ROOT.glob("src/**/.typeunsafe")
+            str(p.parent.relative_to(ROOT))
+            for p in ROOT.glob("src/**/.typeunsafe")
         ]
 
         if len(excluded_folders) > 0:
@@ -113,6 +114,9 @@ sagemaker_api_require = find_requirements(
 shell_require = find_requirements("requirements-extras-shell.txt")
 mxnet_require = find_requirements("requirements-mxnet.txt")
 torch_require = find_requirements("requirements-pytorch.txt")
+mamba_require = find_requirements(
+    "requirements-pytorch.txt"
+) + find_requirements("requirements-mamba.txt")
 
 dev_require = (
     arrow_require
@@ -130,6 +134,7 @@ setup(
         "dev": dev_require,
         "docs": docs_require,
         "mxnet": mxnet_require,
+        "mamba": mamba_require,
         "R": find_requirements("requirements-extras-r.txt"),
         "Prophet": find_requirements("requirements-extras-prophet.txt"),
         "pro": arrow_require + ["orjson"],
