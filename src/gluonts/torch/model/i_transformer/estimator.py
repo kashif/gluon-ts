@@ -22,6 +22,7 @@ from gluonts.dataset.field_names import FieldName
 from gluonts.dataset.loader import as_stacked_batches
 from gluonts.itertools import Cyclic
 from gluonts.transform import (
+    AsNumpyArray,
     Transformation,
     AddObservedValuesIndicator,
     InstanceSampler,
@@ -35,7 +36,7 @@ from gluonts.torch.model.estimator import PyTorchLightningEstimator
 from gluonts.torch.model.predictor import PyTorchPredictor
 from gluonts.torch.distributions import Output, StudentTOutput
 
-from .lightning_module import DLinearLightningModule
+from .lightning_module import ITransformerLightningModule
 
 PREDICTION_INPUT_NAMES = ["past_target", "past_observed_values"]
 
@@ -45,13 +46,13 @@ TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [
 ]
 
 
-class DLinearEstimator(PyTorchLightningEstimator):
+class ITransformerEstimator(PyTorchLightningEstimator):
     """
-    An estimator training the d-linear model form the paper
-    https://arxiv.org/pdf/2205.13504.pdf extended for probabilistic forecasting.
+    An estimator training the iTransformer model for multivariate forecasting as described in
+    https://arxiv.org/abs/2310.06625 extended to be probabilistic.
 
-    This class is uses the model defined in ``DLinearModel``,
-    and wraps it into a ``DLinearLightningModule`` for training
+    This class uses the model defined in ``ITransformerModel``,
+    and wraps it into a ``ITransformerLightningModule`` for training
     purposes: training is performed using PyTorch Lightning's ``pl.Trainer``
     class.
 
@@ -62,17 +63,32 @@ class DLinearEstimator(PyTorchLightningEstimator):
     context_length
         Number of time steps prior to prediction time that the model
         takes as inputs (default: ``10 * prediction_length``).
-    hidden_dimension
-        Size of representation.
+    d_model
+        Size of latent in the Transformer encoder.
+    nhead
+        Number of attention heads in the Transformer encoder which must divide d_model.
+    dim_feedforward
+        Size of hidden layers in the Transformer encoder.
+    dropout
+        Dropout probability in the Transformer encoder.
+    activation
+        Activation function in the Transformer encoder.
+    norm_first
+        Whether to apply normalization before or after the attention.
+    num_encoder_layers
+        Number of layers in the Transformer encoder.
     lr
         Learning rate (default: ``1e-3``).
     weight_decay
         Weight decay regularization parameter (default: ``1e-8``).
-
+    scaling
+        Scaling parameter can be "mean", "std" or None.
     distr_output
         Distribution to use to evaluate observations and sample predictions
         (default: StudentTOutput()).
-    kernel_size
+    num_parallel_samples
+        Number of samples per time series to that the resulting predictor
+        should produce (default: 100).
     batch_size
         The size of the batches to be used for training (default: 32).
     num_batches_per_epoch
@@ -84,6 +100,10 @@ class DLinearEstimator(PyTorchLightningEstimator):
         Controls the sampling of windows during training.
     validation_sampler
         Controls the sampling of windows during validation.
+    nonnegative_pred_samples
+        Should final prediction samples be non-negative? If yes, an activation
+        function is applied to ensure non-negative. Observe that this is applied
+        only to the final samples and this is not applied during training.
     """
 
     @validated()
@@ -91,17 +111,24 @@ class DLinearEstimator(PyTorchLightningEstimator):
         self,
         prediction_length: int,
         context_length: Optional[int] = None,
-        hidden_dimension: Optional[int] = None,
+        d_model: int = 32,
+        nhead: int = 4,
+        dim_feedforward: int = 128,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        norm_first: bool = False,
+        num_encoder_layers: int = 2,
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
         scaling: Optional[str] = "mean",
         distr_output: Output = StudentTOutput(),
-        kernel_size: int = 25,
+        num_parallel_samples: int = 100,
         batch_size: int = 32,
         num_batches_per_epoch: int = 50,
         trainer_kwargs: Optional[Dict[str, Any]] = None,
         train_sampler: Optional[InstanceSampler] = None,
         validation_sampler: Optional[InstanceSampler] = None,
+        nonnegative_pred_samples: bool = False,
     ) -> None:
         default_trainer_kwargs = {
             "max_epochs": 100,
@@ -115,14 +142,21 @@ class DLinearEstimator(PyTorchLightningEstimator):
         self.context_length = context_length or 10 * prediction_length
         # TODO find way to enforce same defaults to network and estimator
         # somehow
-        self.hidden_dimension = hidden_dimension or 20
         self.lr = lr
         self.weight_decay = weight_decay
         self.distr_output = distr_output
+        self.num_parallel_samples = num_parallel_samples
         self.scaling = scaling
-        self.kernel_size = kernel_size
+        self.d_model = d_model
+        self.nhead = nhead
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.activation = activation
+        self.norm_first = norm_first
+        self.num_encoder_layers = num_encoder_layers
         self.batch_size = batch_size
         self.num_batches_per_epoch = num_batches_per_epoch
+        self.nonnegative_pred_samples = nonnegative_pred_samples
 
         self.train_sampler = train_sampler or ExpectedNumInstanceSampler(
             num_instances=1.0, min_future=prediction_length
@@ -132,35 +166,46 @@ class DLinearEstimator(PyTorchLightningEstimator):
         )
 
     def create_transformation(self) -> Transformation:
-        return SelectFields(
-            [
-                FieldName.ITEM_ID,
-                FieldName.INFO,
-                FieldName.START,
-                FieldName.TARGET,
-            ],
-            allow_missing=True,
-        ) + AddObservedValuesIndicator(
-            target_field=FieldName.TARGET,
-            output_field=FieldName.OBSERVED_VALUES,
+        return (
+            SelectFields(
+                [
+                    FieldName.ITEM_ID,
+                    FieldName.INFO,
+                    FieldName.START,
+                    FieldName.TARGET,
+                ],
+                allow_missing=True,
+            )
+            + AsNumpyArray(field=FieldName.TARGET, expected_ndim=2)
+            + AddObservedValuesIndicator(
+                target_field=FieldName.TARGET,
+                output_field=FieldName.OBSERVED_VALUES,
+            )
         )
 
     def create_lightning_module(self) -> pl.LightningModule:
-        return DLinearLightningModule(
+        return ITransformerLightningModule(
             lr=self.lr,
             weight_decay=self.weight_decay,
+            num_parallel_samples=self.num_parallel_samples,
             model_kwargs={
                 "prediction_length": self.prediction_length,
                 "context_length": self.context_length,
-                "hidden_dimension": self.hidden_dimension,
+                "d_model": self.d_model,
+                "nhead": self.nhead,
+                "dim_feedforward": self.dim_feedforward,
+                "dropout": self.dropout,
+                "activation": self.activation,
+                "norm_first": self.norm_first,
+                "num_encoder_layers": self.num_encoder_layers,
                 "distr_output": self.distr_output,
-                "kernel_size": self.kernel_size,
                 "scaling": self.scaling,
+                "nonnegative_pred_samples": self.nonnegative_pred_samples,
             },
         )
 
     def _create_instance_splitter(
-        self, module: DLinearLightningModule, mode: str
+        self, module: ITransformerLightningModule, mode: str
     ):
         assert mode in ["training", "validation", "test"]
 
@@ -178,18 +223,16 @@ class DLinearEstimator(PyTorchLightningEstimator):
             instance_sampler=instance_sampler,
             past_length=self.context_length,
             future_length=self.prediction_length,
-            time_series_fields=[
-                FieldName.OBSERVED_VALUES,
-            ],
+            time_series_fields=[FieldName.OBSERVED_VALUES],
             dummy_value=self.distr_output.value_in_support,
         )
 
     def create_training_data_loader(
         self,
         data: Dataset,
-        module: DLinearLightningModule,
+        module: ITransformerLightningModule,
         shuffle_buffer_length: Optional[int] = None,
-        **kwargs,
+        **kwargs
     ) -> Iterable:
         data = Cyclic(data).stream()
         instances = self._create_instance_splitter(module, "training").apply(
@@ -205,10 +248,7 @@ class DLinearEstimator(PyTorchLightningEstimator):
         )
 
     def create_validation_data_loader(
-        self,
-        data: Dataset,
-        module: DLinearLightningModule,
-        **kwargs,
+        self, data: Dataset, module: ITransformerLightningModule, **kwargs
     ) -> Iterable:
         instances = self._create_instance_splitter(module, "validation").apply(
             data, is_train=True
@@ -221,9 +261,7 @@ class DLinearEstimator(PyTorchLightningEstimator):
         )
 
     def create_predictor(
-        self,
-        transformation: Transformation,
-        module,
+        self, transformation: Transformation, module
     ) -> PyTorchPredictor:
         prediction_splitter = self._create_instance_splitter(module, "test")
 
@@ -231,7 +269,6 @@ class DLinearEstimator(PyTorchLightningEstimator):
             input_transform=transformation + prediction_splitter,
             input_names=PREDICTION_INPUT_NAMES,
             prediction_net=module,
-            forecast_generator=self.distr_output.forecast_generator,
             batch_size=self.batch_size,
             prediction_length=self.prediction_length,
             device="auto",

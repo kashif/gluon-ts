@@ -11,7 +11,7 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-from typing import Tuple, Optional, List
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -20,16 +20,13 @@ from gluonts.core.component import validated
 from gluonts.model import Input, InputSpec
 from gluonts.torch.distributions import StudentTOutput
 from gluonts.torch.scaler import StdScaler, MeanScaler, NOPScaler
-from gluonts.torch.util import unsqueeze_expand, lagged_sequence_values
-from gluonts.time_feature import get_lags_for_frequency
-from gluonts.torch.model.simple_feedforward import make_linear_layer
-from gluonts.torch.model.patch_tst import SinusoidalPositionalEmbedding
 from gluonts.torch.util import weighted_average
 
 
-class LagTSTModel(nn.Module):
+class ITransformerModel(nn.Module):
     """
-    Module implementing the LagTST model for forecasting.
+    Module implementing the iTransformer model for multivariate forecasting as described in
+    https://arxiv.org/abs/2310.06625 extended to be probabilistic.
 
     Parameters
     ----------
@@ -37,9 +34,29 @@ class LagTSTModel(nn.Module):
         Number of time points to predict.
     context_length
         Number of time steps prior to prediction time that the model.
+    d_model
+        Transformer latent dimension.
+    nhead
+        Number of attention heads which must be divisible with d_model.
+    dim_feedforward
+        Dimension of the transformer's feedforward network model.
+    dropout
+        Dropout rate for the transformer.
+    activation
+        Activation function for the transformer.
+    norm_first
+        Whether to normalize the input before the transformer.
+    num_encoder_layers
+        Number of transformer encoder layers.
+    scaling
+        Whether to scale the input using mean or std or None.
     distr_output
         Distribution to use to evaluate observations and sample predictions.
         Default: ``StudentTOutput()``.
+    nonnegative_pred_samples
+        Should final prediction samples be non-negative? If yes, an activation
+        function is applied to ensure non-negative. Observe that this is applied
+        only to the final samples and this is not applied during training.
     """
 
     @validated()
@@ -47,7 +64,6 @@ class LagTSTModel(nn.Module):
         self,
         prediction_length: int,
         context_length: int,
-        freq: str,
         d_model: int,
         nhead: int,
         dim_feedforward: int,
@@ -55,9 +71,9 @@ class LagTSTModel(nn.Module):
         activation: str,
         norm_first: bool,
         num_encoder_layers: int,
-        scaling: str,
-        lags_seq: Optional[List[int]] = None,
+        scaling: Optional[str],
         distr_output=StudentTOutput(),
+        nonnegative_pred_samples: bool = False,
     ) -> None:
         super().__init__()
 
@@ -66,26 +82,23 @@ class LagTSTModel(nn.Module):
 
         self.prediction_length = prediction_length
         self.context_length = context_length
-        self.lags_seq = lags_seq or get_lags_for_frequency(
-            freq_str=freq, num_default_lags=1
-        )
+
         self.d_model = d_model
+        self.nhead = nhead
         self.distr_output = distr_output
 
         if scaling == "mean":
-            self.scaler = MeanScaler(keepdim=True)
+            self.scaler = MeanScaler(keepdim=True, dim=1)
         elif scaling == "std":
-            self.scaler = StdScaler(keepdim=True)
+            self.scaler = StdScaler(keepdim=True, dim=1)
         else:
-            self.scaler = NOPScaler(keepdim=True)
+            self.scaler = NOPScaler(keepdim=True, dim=1)
+        self.nonnegative_pred_samples = nonnegative_pred_samples
 
-        # project from number of lags + 2 features (loc and scale) to d_model
-        self.patch_proj = make_linear_layer(len(self.lags_seq) + 2, d_model)
+        # project each variate plus mean and std to d_model dimension
+        self.emebdding = nn.Linear(context_length + 2, d_model)
 
-        self.positional_encoding = SinusoidalPositionalEmbedding(
-            self.context_length, d_model
-        )
-
+        # transformer encoder
         layer_norm_eps: float = 1e-5
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -102,24 +115,24 @@ class LagTSTModel(nn.Module):
             encoder_layer, num_encoder_layers, encoder_norm
         )
 
-        self.flatten = nn.Linear(
-            d_model * self.context_length, prediction_length * d_model
+        # project each variate to prediction length number of latent variables
+        self.projection = nn.Linear(
+            d_model, prediction_length * d_model // nhead
         )
 
-        self.args_proj = self.distr_output.get_args_proj(d_model)
-
-    @property
-    def _past_length(self) -> int:
-        return self.context_length + max(self.lags_seq)
+        # project each prediction length latent to distribution parameters
+        self.args_proj = self.distr_output.get_args_proj(d_model // nhead)
 
     def describe_inputs(self, batch_size=1) -> InputSpec:
         return InputSpec(
             {
                 "past_target": Input(
-                    shape=(batch_size, self._past_length), dtype=torch.float
+                    shape=(batch_size, self.context_length, -1),
+                    dtype=torch.float,
                 ),
                 "past_observed_values": Input(
-                    shape=(batch_size, self._past_length), dtype=torch.float
+                    shape=(batch_size, self.context_length, -1),
+                    dtype=torch.float,
                 ),
             },
             torch.zeros,
@@ -134,38 +147,38 @@ class LagTSTModel(nn.Module):
         past_target_scaled, loc, scale = self.scaler(
             past_target, past_observed_values
         )
-
-        lags = lagged_sequence_values(
-            self.lags_seq,
-            past_target_scaled[:, : -self.context_length, ...],
-            past_target_scaled[:, -self.context_length :, ...],
-            dim=-1,
-        )
-
-        # add loc and scale to past_target_patches as additional features
         log_abs_loc = loc.abs().log1p()
         log_scale = scale.log()
-        expanded_static_feat = unsqueeze_expand(
-            torch.cat([log_abs_loc, log_scale], dim=-1),
-            dim=1,
-            size=lags.shape[1],
-        )
-        inputs = torch.cat((lags, expanded_static_feat), dim=-1)
 
-        # project patches
-        enc_in = self.patch_proj(inputs)
-        embed_pos = self.positional_encoding(enc_in.size())
+        # Transpose to time last
+        past_target_scaled = past_target_scaled.transpose(1, 2)
+        log_abs_loc = log_abs_loc.transpose(1, 2)
+        log_scale = log_scale.transpose(1, 2)
+
+        # concatenate past target with log_abs_loc and log_scale
+        expanded_target_scaled = torch.cat(
+            [past_target_scaled, log_abs_loc, log_scale], dim=-1
+        )
+
+        # project to d_model
+        enc_in = self.emebdding(expanded_target_scaled)
 
         # transformer encoder with positional encoding
-        enc_out = self.encoder(enc_in + embed_pos)
+        enc_out = self.encoder(enc_in)
 
-        # flatten and project to prediction length * d_model
-        flatten_out = self.flatten(enc_out.flatten(start_dim=1))
+        # project to prediction length * d_model // nhead
+        projection_out = self.projection(enc_out).reshape(
+            -1,
+            past_target.shape[2],
+            self.prediction_length,
+            self.d_model // self.nhead,
+        )
+
+        # transpose to prediction length first
+        projection_out_transpose = projection_out.transpose(1, 2)
 
         # project to distribution arguments
-        distr_args = self.args_proj(
-            flatten_out.reshape(-1, self.prediction_length, self.d_model)
-        )
+        distr_args = self.args_proj(projection_out_transpose)
         return distr_args, loc, scale
 
     def loss(

@@ -17,23 +17,23 @@ import torch
 from gluonts.core.component import validated
 from gluonts.itertools import select
 
-from .module import SimpleFeedForwardModel
+from .module import ITransformerModel
 
 
-class SimpleFeedForwardLightningModule(pl.LightningModule):
+class ITransformerLightningModule(pl.LightningModule):
     """
     A ``pl.LightningModule`` class that can be used to train a
-    ``SimpleFeedForwardModel`` with PyTorch Lightning.
+    ``ITransformerModel`` with PyTorch Lightning.
 
-    This is a thin layer around a (wrapped) ``SimpleFeedForwardModel`` object,
+    This is a thin layer around a (wrapped) ``ITransformerModel`` object,
     that exposes the methods to evaluate training and validation loss.
 
     Parameters
     ----------
     model_kwargs
-        Keyword arguments to construct the ``SimpleFeedForwardModel`` to be trained.
-    loss
-        Loss function to be used for training.
+        Keyword arguments to construct the ``ITransformerModel`` to be trained.
+    num_parallel_samples:
+        Number of evaluation samples per time series to sample during inference.
     lr
         Learning rate.
     weight_decay
@@ -44,18 +44,26 @@ class SimpleFeedForwardLightningModule(pl.LightningModule):
     def __init__(
         self,
         model_kwargs: dict,
+        num_parallel_samples: int = 100,
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = SimpleFeedForwardModel(**model_kwargs)
+        self.model = ITransformerModel(**model_kwargs)
+        self.num_parallel_samples = num_parallel_samples
         self.lr = lr
         self.weight_decay = weight_decay
         self.inputs = self.model.describe_inputs()
 
     def forward(self, *args, **kwargs):
-        return self.model.forward(*args, **kwargs)
+        distr_args, loc, scale = self.model.forward(*args, **kwargs)
+        distr = self.model.distr_output.distribution(distr_args, loc, scale)
+
+        samples = distr.sample((self.num_parallel_samples,))
+        if self.model.nonnegative_pred_samples:
+            samples = torch.relu(samples)
+        return samples.transpose(0, 1)
 
     def training_step(self, batch, batch_idx: int):  # type: ignore
         """
