@@ -12,6 +12,7 @@
 # permissions and limitations under the License.
 
 from typing import List, Optional, Tuple
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -24,7 +25,6 @@ from gluonts.torch.distributions import (
 )
 from gluonts.torch.scaler import Scaler, MeanScaler, NOPScaler
 from gluonts.torch.modules.feature import FeatureEmbedder
-from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
 from gluonts.torch.util import (
     lagged_sequence_values,
     repeat_along_dim,
@@ -33,8 +33,39 @@ from gluonts.torch.util import (
 )
 from gluonts.itertools import prod
 from gluonts.model import Input, InputSpec
-from mamba_ssm import Mamba
+from mamba_ssm.modules.mamba_simple import Mamba, Block
+try:
+    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+except ImportError:
+    RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+def create_block(
+    d_model,
+    ssm_cfg=None,
+    norm_epsilon=1e-5,
+    rms_norm=False,
+    residual_in_fp32=False,
+    fused_add_norm=False,
+    layer_idx=None,
+    device=None,
+    dtype=None,
+):
+    if ssm_cfg is None:
+        ssm_cfg = {}
+    factory_kwargs = {"device": device, "dtype": dtype}
+    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    norm_cls = partial(
+        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+    )
+    block = Block(
+        d_model,
+        mixer_cls,
+        norm_cls=norm_cls,
+        fused_add_norm=fused_add_norm,
+        residual_in_fp32=residual_in_fp32,
+    )
+    block.layer_idx = layer_idx
+    return block
 
 class MambaModel(nn.Module):
     """
@@ -68,8 +99,6 @@ class MambaModel(nn.Module):
         Number of layers in the RNN.
     hidden_size
         Size of the hidden layers in the RNN.
-    dropout_rate
-        Dropout rate to be applied at training time.
     distr_output
         Type of distribution to be output by the model at each time step
     lags_seq
@@ -106,7 +135,11 @@ class MambaModel(nn.Module):
         embedding_dimension: Optional[List[int]] = None,
         num_layers: int = 2,
         hidden_size: int = 40,
-        dropout_rate: float = 0.1,
+        ssm_cfg=None,
+        norm_epsilon: float = 1e-5,
+        rms_norm: bool = False,
+        fused_add_norm:bool = False,
+        residual_in_fp32:bool = False,
         distr_output: DistributionOutput = StudentTOutput(),
         lags_seq: Optional[List[int]] = None,
         scaling: bool = True,
@@ -151,19 +184,32 @@ class MambaModel(nn.Module):
             )
         else:
             self.scaler = NOPScaler(dim=-1, keepdim=True)
-        self.d_model = len(self.lags_seq) + self._number_of_features
+        input_size = len(self.lags_seq) + self._number_of_features
+        self.projection = nn.Linear(input_size, hidden_size, bias=False)
 
-        self.mamba = Mamba(
-            d_model=self.d_model,
-            d_state=16,
-            d_conv=4,
-            expand=2,
-            # input_size=self.rnn_input_size,
-            # hidden_size=hidden_size,
-            # num_layers=num_layers,
-            # dropout=dropout_rate,
-            # batch_first=True,
+        self.fused_add_norm = fused_add_norm
+        if self.fused_add_norm:
+            if layer_norm_fn is None or rms_norm_fn is None:
+                raise ImportError("Failed to import Triton LayerNorm / RMSNorm kernels")
+            
+        self.layers = nn.ModuleList(
+            [
+                create_block(
+                    hidden_size,
+                    ssm_cfg=ssm_cfg,
+                    norm_epsilon=norm_epsilon,
+                    rms_norm=rms_norm,
+                    residual_in_fp32=residual_in_fp32,
+                    fused_add_norm=fused_add_norm,
+                    layer_idx=i,
+                )
+                for i in range(num_layers)
+            ]
         )
+        self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(
+            hidden_size, eps=norm_epsilon
+        )
+
         self.nonnegative_pred_samples = nonnegative_pred_samples
         self.param_proj = distr_output.get_args_proj(self.d_model)
 
@@ -271,6 +317,32 @@ class MambaModel(nn.Module):
         features = torch.cat((expanded_static_feat, time_feat), dim=-1)
 
         return torch.cat((lags, features), dim=-1), scale, static_feat
+    
+    
+    def mamba(self, mamba_input):
+        # output = self.mamba(mamba_input)
+        hidden_states = self.projection(mamba_input)
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                hidden_states, residual, inference_params=None
+            )
+        if not self.fused_add_norm:
+            residual = (hidden_states + residual) if residual is not None else hidden_states
+            hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+        else:
+            # Set prenorm=False here since we don't need the residual
+            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
+            hidden_states = fused_add_norm_fn(
+                hidden_states,
+                self.norm_f.weight,
+                self.norm_f.bias,
+                eps=self.norm_f.eps,
+                residual=residual,
+                prenorm=False,
+                residual_in_fp32=self.residual_in_fp32,
+            )
+        return hidden_states
 
     def unroll_lagged_mamba(
         self,
@@ -335,10 +407,9 @@ class MambaModel(nn.Module):
             future_target,
         )
 
-        output = self.mamba(mamba_input)
-
-        params = self.param_proj(output)
-        return params, scale, output, static_feat
+        hidden_state = self.mamba(mamba_input)
+        params = self.param_proj(hidden_state)
+        return params, scale, static_feat, hidden_state
 
     @torch.jit.ignore
     def output_distribution(
@@ -425,7 +496,7 @@ class MambaModel(nn.Module):
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
 
-        params, scale, _, static_feat = self.unroll_lagged_mamba(
+        params, scale, static_feat, _ = self.unroll_lagged_mamba(
             feat_static_cat,
             feat_static_real,
             past_time_feat,
@@ -447,10 +518,6 @@ class MambaModel(nn.Module):
         repeated_time_feat = future_time_feat.repeat_interleave(
             repeats=num_parallel_samples, dim=0
         )
-        # repeated_state = [
-        #     s.repeat_interleave(repeats=num_parallel_samples, dim=1)
-        #     for s in state
-        # ]
 
         repeated_params = [
             s.repeat_interleave(repeats=num_parallel_samples, dim=0)
@@ -471,7 +538,7 @@ class MambaModel(nn.Module):
             next_lags = lagged_sequence_values(
                 self.lags_seq, repeated_past_target, scaled_next_sample, dim=-1
             )
-            rnn_input = torch.cat((next_lags, next_features), dim=-1)
+            mamba_input = torch.cat((next_lags, next_features), dim=-1)
 
             output = self.mamba(rnn_input)
 
@@ -513,7 +580,6 @@ class MambaModel(nn.Module):
             future_time_feat=future_time_feat,
             future_target=future_target,
             future_observed_values=torch.ones_like(future_target),
-            loss=NegativeLogLikelihood(),
             future_only=True,
             aggregate_by=torch.sum,
         )
@@ -528,7 +594,6 @@ class MambaModel(nn.Module):
         future_time_feat: torch.Tensor,
         future_target: torch.Tensor,
         future_observed_values: torch.Tensor,
-        loss: DistributionLoss = NegativeLogLikelihood(),
         future_only: bool = False,
         aggregate_by=torch.mean,
     ) -> torch.Tensor:
@@ -566,14 +631,16 @@ class MambaModel(nn.Module):
         )
 
         if future_only:
-            distr = self.output_distribution(
-                params, scale, trailing_n=self.prediction_length
+            sliced_params = tuple(
+                [p[:, -self.prediction_length :] for p in params]
             )
-            loss_values = (
-                loss(distr, future_target_reshaped) * future_observed_reshaped
+            loss_values = self.distr_output.loss(
+                target=future_target_reshaped,
+                distr_args=sliced_params,
+                scale=scale,
             )
+            loss_values = loss_values * future_observed_reshaped
         else:
-            distr = self.output_distribution(params, scale)
             context_target = take_last(
                 past_target, dim=-1, num=self.context_length - 1
             )
@@ -587,7 +654,10 @@ class MambaModel(nn.Module):
             observed_values = torch.cat(
                 (context_observed, future_observed_reshaped), dim=1
             )
-            loss_values = loss(distr, target) * observed_values
+            loss_values = self.distr_output.loss(
+                target=target, distr_args=params, scale=scale
+            )
+            loss_values = loss_values * observed_values
 
         loss_values = loss_values.reshape(*batch_shape, *loss_values.shape[1:])
 

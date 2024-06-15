@@ -25,7 +25,6 @@ from gluonts.time_feature import (
     TimeFeature,
     time_features_from_frequency_str,
 )
-from gluonts.torch.modules.loss import DistributionLoss, NegativeLogLikelihood
 from gluonts.transform import (
     Transformation,
     Chain,
@@ -90,8 +89,6 @@ class MambaEstimator(PyTorchLightningEstimator):
         Learning rate (default: ``1e-3``).
     weight_decay
         Weight decay regularization parameter (default: ``1e-8``).
-    dropout_rate
-        Dropout regularization parameter (default: 0.1).
     patience
         Patience parameter for learning rate scheduler.
     num_feat_dynamic_real
@@ -109,9 +106,6 @@ class MambaEstimator(PyTorchLightningEstimator):
     distr_output
         Distribution to use to evaluate observations and sample predictions
         (default: StudentTOutput()).
-    loss
-        Loss to be optimized during training
-        (default: ``NegativeLogLikelihood()``).
     scaling
         Whether to automatically scale the target values (default: true).
     default_scale
@@ -156,7 +150,6 @@ class MambaEstimator(PyTorchLightningEstimator):
         hidden_size: int = 40,
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
-        dropout_rate: float = 0.1,
         patience: int = 10,
         num_feat_dynamic_real: int = 0,
         num_feat_static_cat: int = 0,
@@ -164,7 +157,6 @@ class MambaEstimator(PyTorchLightningEstimator):
         cardinality: Optional[List[int]] = None,
         embedding_dimension: Optional[List[int]] = None,
         distr_output: DistributionOutput = StudentTOutput(),
-        loss: DistributionLoss = NegativeLogLikelihood(),
         scaling: bool = True,
         default_scale: Optional[float] = None,
         lags_seq: Optional[List[int]] = None,
@@ -193,12 +185,10 @@ class MambaEstimator(PyTorchLightningEstimator):
         self.prediction_length = prediction_length
         self.patience = patience
         self.distr_output = distr_output
-        self.loss = loss
         self.num_layers = num_layers
         self.hidden_size = hidden_size
         self.lr = lr
         self.weight_decay = weight_decay
-        self.dropout_rate = dropout_rate
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_feat_static_cat = num_feat_static_cat
         self.num_feat_static_real = num_feat_static_real
@@ -376,7 +366,6 @@ class MambaEstimator(PyTorchLightningEstimator):
 
     def create_lightning_module(self) -> MambaLightningModule:
         return MambaLightningModule(
-            loss=self.loss,
             lr=self.lr,
             weight_decay=self.weight_decay,
             patience=self.patience,
@@ -394,7 +383,6 @@ class MambaEstimator(PyTorchLightningEstimator):
                 "num_layers": self.num_layers,
                 "hidden_size": self.hidden_size,
                 "distr_output": self.distr_output,
-                "dropout_rate": self.dropout_rate,
                 "lags_seq": self.lags_seq,
                 "scaling": self.scaling,
                 "default_scale": self.default_scale,
