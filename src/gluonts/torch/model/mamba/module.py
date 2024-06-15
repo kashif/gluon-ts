@@ -129,7 +129,6 @@ class MambaModel(nn.Module):
         self.context_length = context_length
         self.prediction_length = prediction_length
         self.distr_output = distr_output
-        self.param_proj = distr_output.get_args_proj(hidden_size)
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_feat_static_cat = num_feat_static_cat
         self.num_feat_static_real = num_feat_static_real
@@ -166,6 +165,8 @@ class MambaModel(nn.Module):
             # batch_first=True,
         )
         self.nonnegative_pred_samples = nonnegative_pred_samples
+        self.param_proj = distr_output.get_args_proj(self.d_model)
+
 
     def describe_inputs(self, batch_size=1) -> InputSpec:
         return InputSpec(
@@ -472,7 +473,7 @@ class MambaModel(nn.Module):
             )
             rnn_input = torch.cat((next_lags, next_features), dim=-1)
 
-            output, repeated_state = self.rnn(rnn_input, repeated_state)
+            output = self.mamba(rnn_input)
 
             repeated_past_target = torch.cat(
                 (repeated_past_target, scaled_next_sample), dim=1
