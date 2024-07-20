@@ -147,7 +147,7 @@ class MambaEstimator(PyTorchLightningEstimator):
         prediction_length: int,
         context_length: Optional[int] = None,
         num_layers: int = 2,
-        hidden_size: int = 40,
+        hidden_size: int = 64,
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
         patience: int = 10,
