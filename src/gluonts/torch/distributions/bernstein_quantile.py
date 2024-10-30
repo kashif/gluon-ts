@@ -14,11 +14,8 @@
 from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.distributions import (
     Distribution,
-    AffineTransform,
-    TransformedDistribution,
 )
 
 from gluonts.core.component import validated
@@ -169,13 +166,18 @@ class BernsteinQuantileOutput(DistributionOutput):
         self.degree = degree
         self.args_dim: Dict[str, int] = {"coefficients": degree + 1}
 
-    def domain_map(self, coefficients: torch.Tensor) -> Tuple[torch.Tensor]:
+    @staticmethod
+    def squareplus(x: torch.Tensor) -> torch.Tensor:
+        return (x + torch.sqrt(x**2 + 4)) / 2
+
+    @classmethod
+    def domain_map(cls, coefficients: torch.Tensor) -> Tuple[torch.Tensor]:
         """
         Ensures coefficients are monotonically increasing by applying cumulative sum
         of positive values.
         """
         # Apply softplus and cumsum to ensure monotonicity
-        return (F.softplus(coefficients).cumsum(dim=-1),)
+        return (cls.squareplus(coefficients).cumsum(dim=-1),)
 
     def distribution(
         self,
@@ -187,14 +189,12 @@ class BernsteinQuantileOutput(DistributionOutput):
         Create distribution instance with given parameters.
         """
         coefficients = distr_args[0]
-        distr = self.distr_cls(coefficients, self.degree)
+        if loc is not None:
+            coefficients = coefficients + loc
+        if scale is not None:
+            coefficients = coefficients * scale
 
-        if scale is None:
-            return distr
-        else:
-            return TransformedDistribution(
-                distr, [AffineTransform(loc=loc, scale=scale)]
-            )
+        return self.distr_cls(coefficients, self.degree)
 
     @property
     def event_shape(self) -> Tuple:

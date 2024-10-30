@@ -12,6 +12,7 @@
 # permissions and limitations under the License.
 
 from .affine_transformed import AffineTransformed
+from .bernstein_quantile import BernsteinQuantileDistribution, BernsteinQuantileOutput
 from .binned_uniforms import BinnedUniforms, BinnedUniformsOutput
 from .discrete_distribution import DiscreteDistribution
 from .distribution_output import (
@@ -41,6 +42,8 @@ from .truncated_normal import TruncatedNormal, TruncatedNormalOutput
 
 __all__ = [
     "AffineTransformed",
+    "BernsteinQuantileDistribution",
+    "BernsteinQuantileOutput",
     "BetaOutput",
     "BinnedUniforms",
     "BinnedUniformsOutput",
