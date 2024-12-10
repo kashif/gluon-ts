@@ -17,6 +17,7 @@ from collections import OrderedDict
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from gluonts.core.component import validated
 from gluonts.model import Input, InputSpec
@@ -45,6 +46,7 @@ ACT2CLS = {
 }
 ACT2FN = ClassInstantier(ACT2CLS)
 
+
 class Patch(nn.Module):
     def __init__(self, patch_size: int, patch_stride: int) -> None:
         super().__init__()
@@ -60,11 +62,16 @@ class Patch(nn.Module):
                 self.patch_size - (length % self.patch_size),
             )
             padding = torch.full(
-                size=padding_size, fill_value=torch.nan, dtype=x.dtype, device=x.device
+                size=padding_size,
+                fill_value=torch.nan,
+                dtype=x.dtype,
+                device=x.device,
             )
             x = torch.concat((padding, x), dim=-1)
 
-        x = x.unfold(dimension=-1, size=self.patch_size, step=self.patch_stride)
+        x = x.unfold(
+            dimension=-1, size=self.patch_size, step=self.patch_stride
+        )
         return x
 
 
@@ -102,6 +109,52 @@ class ResidualBlock(nn.Module):
         return out
 
 
+class Flow(nn.Module):
+    def __init__(self, cond_dim: int, out_dim: int, h: int):
+        super().__init__()
+
+        self.linear = nn.Linear(out_dim + cond_dim + 1, h)
+        self.act = ACT2FN["gelu"]
+        self.output_layer = nn.Linear(h, out_dim)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor):
+        x = torch.cat((x_t, t, cond), dim=-1)
+        x = self.linear(x)
+        x = self.act(x)
+        x = self.output_layer(x)
+        return x
+
+    @torch.inference_mode()
+    def step(
+        self,
+        x_t: torch.Tensor,
+        t_start: float,
+        t_end: float,
+        cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """Performs one step of the flow matching process.
+
+        Args:
+            x_t: Input tensor to evolve
+            t_start: Starting time
+            t_end: Ending time
+            cond: Conditioning tensor from transformer decoder
+        """
+        # Expand t_start to match batch dimension
+        t_start = torch.full((x_t.shape[0], 1), t_start, device=x_t.device)
+        t_mid = t_start + (t_end - t_start) / 2
+
+        # First half step
+        v1 = self(x_t=x_t, t=t_start, cond=cond)
+        x_mid = x_t + v1 * (t_end - t_start) / 2
+
+        # Second half step
+        v2 = self(x_t=x_mid, t=t_mid, cond=cond)
+        x_end = x_t + v2 * (t_end - t_start)
+
+        return x_end
+
+
 class SegDiffModel(nn.Module):
     """
     Module implementing the SegDiff model for forecasting.
@@ -134,7 +187,7 @@ class SegDiffModel(nn.Module):
         scaling: str,
         dropout_rate: float = 0.1,
         num_parallel_samples: int = 100,
-        distr_output=StudentTOutput(),
+        flow_hidden_dim: int = 64,
     ) -> None:
         super().__init__()
 
@@ -142,9 +195,7 @@ class SegDiffModel(nn.Module):
 
         self.context_length = context_length_multiplier * patch_len
         self.patch_len = patch_len
-        self.context_length_multiplier = context_length_multiplier
         self.d_model = d_model
-        self.distr_output = distr_output
         self.num_feat_dynamic_real = num_feat_dynamic_real
         self.num_parallel_samples = num_parallel_samples
 
@@ -180,14 +231,14 @@ class SegDiffModel(nn.Module):
             norm_first=norm_first,
         )
         decoder_norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
-       
+
         self.decoder = nn.TransformerEncoder(
             decoder_layer, num_decoder_layers, decoder_norm
         )
 
-        self.proj = nn.Linear(d_model, patch_len * context_length_multiplier)
-
-        self.args_proj = self.distr_output.get_args_proj(context_length_multiplier)
+        self.flow = Flow(
+            cond_dim=d_model, out_dim=patch_len, h=flow_hidden_dim
+        )
 
     def describe_inputs(self, batch_size=1) -> InputSpec:
         if self.num_feat_dynamic_real > 0:
@@ -233,12 +284,13 @@ class SegDiffModel(nn.Module):
         future_observed_values: Optional[torch.Tensor] = None,
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
-    ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
-
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if future_target is not None and future_observed_values is not None:
             past_target = torch.cat((past_target, future_target), dim=1)
-            past_observed_values = torch.cat((past_observed_values, future_observed_values), dim=1)
-            
+            past_observed_values = torch.cat(
+                (past_observed_values, future_observed_values), dim=1
+            )
+
         # scale the input
         past_target_scaled, loc, scale = self.scaler(
             past_target, past_observed_values
@@ -251,7 +303,7 @@ class SegDiffModel(nn.Module):
             patched_time_feat = self.patch(time_feat)
 
         # add loc and scale to past_target_patches as additional features
-        log_abs_loc = loc.abs().log1p()
+        log_abs_loc = loc.sign() * loc.abs().log1p()
         log_scale = scale.log()
 
         expanded_static_feat = unsqueeze_expand(
@@ -267,17 +319,15 @@ class SegDiffModel(nn.Module):
         input_embeddings = self.input_patch_embedding(inputs)
 
         # causal mask for the transformer decoder
-        mask = nn.Transformer.generate_square_subsequent_mask(input_embeddings.shape[1], device=input_embeddings.device)
+        mask = nn.Transformer.generate_square_subsequent_mask(
+            input_embeddings.shape[1], device=input_embeddings.device
+        )
         # transformer encoder with positional encoding
         dec_out = self.decoder(input_embeddings, is_causal=True, mask=mask)
-        
-        num_patches = dec_out.shape[1]
-        # flatten and project to [batch_size, num_patches, patch_len=prediction_length, self.context_length_multiplier]
-        dec_proj = self.proj(dec_out).reshape(-1, num_patches, self.patch_len, self.context_length_multiplier)
 
-        # project to distribution for each predciction length by mapping the last dimension to the distribution  parameters
-        distr_args = self.args_proj(dec_proj)
-        return distr_args, loc, scale
+        # # Project decoder output to condition the flow
+        # flow_cond = self.proj(dec_out)
+        return dec_out, loc, scale
 
     def loss(
         self,
@@ -288,7 +338,7 @@ class SegDiffModel(nn.Module):
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        distr_args, loc, scale = self.params_from_decoder_output(
+        flow_cond, loc, scale = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
             past_time_feat=past_time_feat,
@@ -296,17 +346,24 @@ class SegDiffModel(nn.Module):
             future_target=future_target,
             future_observed_values=future_observed_values,
         )
-        # take all but the last distribution arguments for the future
-        # shape [[B, T, patch_len], [B, T, patch_len], ...]  are all the arguments
-        distr_args = [params[:, :-1, :] for params in distr_args]
-
-        target = self.patch(torch.cat((past_target, future_target), dim=1))
-        observed_values = self.patch(torch.cat((past_observed_values, future_observed_values), dim=1))
-
-        loss = self.distr_output.loss(
-            target=target[:, 1:, :], distr_args=distr_args, loc=loc.unsqueeze(-1), scale=scale.unsqueeze(-1)
+        # Get patches for target
+        target = self.patch(
+            (torch.cat((past_target, future_target), dim=1) - loc) / scale
         )
-        return weighted_average(loss, weights=observed_values[:, 1:, :], dim=-1)
+
+        # Flow matching loss
+        x_1 = target[:, 1:, :]  # Target patches
+        x_0 = torch.randn_like(x_1)  # Random noise source distribution
+        # t is a tensor of shape (batch_size, num_patches, 1)
+        t = torch.rand((x_1.shape[0], x_1.shape[1], 1), device=x_1.device)
+
+        x_t = (1 - t) * x_0 + t * x_1
+        dx_t = x_1 - x_0
+
+        # Condition flow on decoder output
+        flow_out = self.flow(t=t, x_t=x_t, cond=flow_cond[:, :-1, :])
+
+        return F.mse_loss(flow_out, dx_t)
 
     def forward(
         self,
@@ -319,61 +376,115 @@ class SegDiffModel(nn.Module):
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
 
-        distr_args, loc, scale = self.params_from_decoder_output(
+        # Get initial flow conditioning from decoder
+        flow_cond, loc, scale = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
             past_time_feat=past_time_feat,
         )
 
-        # repeat the parameters for each parallel sample
-        repeated_scale = scale.repeat_interleave(repeats=num_parallel_samples, dim=0)
-        repeated_loc = loc.repeat_interleave(repeats=num_parallel_samples, dim=0)
-        
-        repeated_past_target = past_target.repeat_interleave(repeats=num_parallel_samples, dim=0)
-        repeated_past_observed_values = past_observed_values.repeat_interleave(repeats=num_parallel_samples, dim=0)
+        # Initialize samples for each batch
+        batch_size = past_target.shape[0]
 
-        repeated_past_time_feat = past_time_feat.repeat_interleave(repeats=num_parallel_samples, dim=0) if past_time_feat is not None else None
-        repeated_future_time_feat = future_time_feat.repeat_interleave(repeats=num_parallel_samples, dim=0) if future_time_feat is not None else None
+        # Sample initial noise for each batch and parallel sample
+        x = torch.randn(
+            batch_size * num_parallel_samples,
+            self.patch_len,
+            device=past_target.device,
+        )
 
-        # take the very last distribution arguments to sample the next patch_len time steps
-        repeated_distr_args = [params[:, -1, ...].repeat_interleave(repeats=num_parallel_samples, dim=0) for params in distr_args]
+        # Setup time steps for flow
+        n_steps = 8
+        time_steps = torch.linspace(0, 1.0, n_steps + 1, device=x.device)
 
-        next_sample = self.distr_output.distribution(repeated_distr_args, loc=repeated_loc, scale=repeated_scale).sample()
+        # Get last decoder output and repeat for parallel samples
+        last_cond = flow_cond[:, -1, :].repeat_interleave(
+            num_parallel_samples, dim=0
+        )
+
+        # Evolve the samples through time using the flow
+        for i in range(n_steps):
+            x = self.flow.step(
+                x_t=x,
+                t_start=time_steps[i],
+                t_end=time_steps[i + 1],
+                cond=last_cond,
+            )
+
+        # Reshape and scale the samples
+        next_sample = x.view(
+            batch_size, num_parallel_samples, self.patch_len
+        ) * scale.unsqueeze(1) + loc.unsqueeze(1)
         future_samples = [next_sample]
         total_samples = self.patch_len
 
-        # sample the next patch_len time steps until the prediction length is reached
+        # Repeat interleave inputs for parallel sampling
+        repeat_past_target = past_target.repeat_interleave(
+            num_parallel_samples, dim=0
+        )
+        repeat_past_observed_values = past_observed_values.repeat_interleave(
+            num_parallel_samples, dim=0
+        )
+        if past_time_feat is not None:
+            repeat_past_time_feat = past_time_feat.repeat_interleave(
+                num_parallel_samples, dim=0
+            )
+        if future_time_feat is not None:
+            repeat_future_time_feat = future_time_feat.repeat_interleave(
+                num_parallel_samples, dim=0
+            )
+
+        # Continue sampling until prediction length is reached
         while total_samples < self.prediction_length:
-            repeated_past_target = torch.cat(
-                (repeated_past_target, next_sample),
-                dim=1,
+            # Get updated conditioning by feeding previous samples back through decoder
+            future_samples_flat = torch.cat(
+                future_samples, dim=-1
+            )  # Combine all generated patches
+            future_samples_flat = future_samples_flat.view(
+                batch_size * num_parallel_samples, -1
             )
-            repeated_past_observed_values = torch.cat(
-                (repeated_past_observed_values, torch.ones_like(next_sample)),
-                dim=1,
+
+            flow_cond, loc, scale = self.params_from_decoder_output(
+                past_target=repeat_past_target,
+                past_observed_values=repeat_past_observed_values,
+                past_time_feat=repeat_past_time_feat
+                if past_time_feat is not None
+                else None,
+                future_target=future_samples_flat,
+                future_observed_values=torch.ones_like(future_samples_flat),
+                future_time_feat=repeat_future_time_feat
+                if future_time_feat is not None
+                else None,
             )
-            if repeated_past_time_feat is not None and repeated_future_time_feat is not None:
-                repeated_past_time_feat = torch.cat(
-                    (repeated_past_time_feat, repeated_future_time_feat[:, total_samples - next_sample.shape[1] : total_samples]),
-                    dim=1,
+
+            # Sample new noise for next patch
+            x = torch.randn(
+                batch_size * num_parallel_samples,
+                self.patch_len,
+                device=past_target.device,
+            )
+
+            # Use updated conditioning from decoder
+            last_cond = flow_cond[:, -1, :]
+
+            # Evolve the new samples
+            for i in range(n_steps):
+                x = self.flow.step(
+                    x_t=x,
+                    t_start=time_steps[i],
+                    t_end=time_steps[i + 1],
+                    cond=last_cond,
                 )
-            distr_args, _, _ = self.params_from_decoder_output(
-                past_target=repeated_past_target,
-                past_observed_values=repeated_past_observed_values,
-                past_time_feat=repeated_past_time_feat,
+
+            # Scale and store the samples
+            next_sample = x.view(
+                batch_size, num_parallel_samples, self.patch_len
+            ) * scale.view(batch_size, num_parallel_samples, -1) + loc.view(
+                batch_size, num_parallel_samples, -1
             )
-            repeated_distr_args = [params[:, -1, ...] for params in distr_args]
-            next_sample = self.distr_output.distribution(repeated_distr_args, loc=repeated_loc, scale=repeated_scale).sample()
             future_samples.append(next_sample)
             total_samples += self.patch_len
 
-        future_samples_concat = torch.cat(future_samples, dim=1)
-
-        # Trim any extra predictions
-        future_samples_concat = future_samples_concat[:, :self.prediction_length]
-
-        # reshape the samples to the desired shape
-        return future_samples_concat.reshape(
-            (-1, num_parallel_samples, self.prediction_length)
-        )
-        
+        # Concatenate and trim to prediction length
+        future_samples_concat = torch.cat(future_samples, dim=-1)
+        return future_samples_concat[..., : self.prediction_length]

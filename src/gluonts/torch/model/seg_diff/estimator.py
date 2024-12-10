@@ -87,9 +87,9 @@ class SegDiffEstimator(PyTorchLightningEstimator):
         Weight decay regularization parameter (default: ``1e-8``).
     scaling
         Scaling parameter can be "mean", "std" or None.
-    distr_output
-        Distribution to use to evaluate observations and sample predictions
-        (default: StudentTOutput()).
+    # distr_output
+    #     Distribution to use to evaluate observations and sample predictions
+    #     (default: StudentTOutput()).
     batch_size
         The size of the batches to be used for training (default: 32).
     num_batches_per_epoch
@@ -120,7 +120,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
         lr: float = 1e-3,
         weight_decay: float = 1e-8,
         scaling: Optional[str] = "mean",
-        distr_output: Output = StudentTOutput(),
+        # distr_output: Output = StudentTOutput(),
         batch_size: int = 32,
         num_batches_per_epoch: int = 50,
         trainer_kwargs: Optional[Dict[str, Any]] = None,
@@ -141,7 +141,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
 
         self.lr = lr
         self.weight_decay = weight_decay
-        self.distr_output = distr_output
+        # self.distr_output = distr_output
         self.scaling = scaling
         self.patch_len = patch_len
         self.d_model = d_model
@@ -201,7 +201,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
                 "activation": self.activation,
                 "norm_first": self.norm_first,
                 "num_decoder_layers": self.num_decoder_layers,
-                "distr_output": self.distr_output,
+                # "distr_output": self.distr_output,
                 "scaling": self.scaling,
             },
         )
@@ -229,7 +229,6 @@ class SegDiffEstimator(PyTorchLightningEstimator):
             + (
                 [FieldName.FEAT_TIME] if self.num_feat_dynamic_real > 0 else []
             ),
-            dummy_value=self.distr_output.value_in_support,
         )
 
     def create_training_data_loader(
