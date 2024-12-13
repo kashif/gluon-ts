@@ -113,6 +113,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
         nhead: int = 4,
         dim_feedforward: int = 128,
         num_feat_dynamic_real: int = 0,
+        n_steps: int = 10,
         dropout: float = 0.1,
         activation: str = "relu",
         norm_first: bool = False,
@@ -138,6 +139,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
         self.context_length = patch_len * context_length_multiplier
         self.context_length_multiplier = context_length_multiplier
         self.prediction_length = prediction_length
+        self.n_steps = n_steps
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -203,6 +205,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
                 "num_decoder_layers": self.num_decoder_layers,
                 # "distr_output": self.distr_output,
                 "scaling": self.scaling,
+                "n_steps": self.n_steps,
             },
         )
 
