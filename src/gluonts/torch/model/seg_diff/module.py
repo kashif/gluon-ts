@@ -24,15 +24,17 @@ from gluonts.model import Input, InputSpec
 from gluonts.torch.scaler import StdScaler, MeanScaler, NOPScaler
 from gluonts.torch.util import take_last, unsqueeze_expand, weighted_average
 from gluonts.torch.model.simple_feedforward import make_linear_layer
-from flow_matching.path.scheduler import (
-    CondOTScheduler,
-    CosineScheduler,
-    PolynomialConvexScheduler,
-    VPScheduler,
-    LinearVPScheduler,
-)
-from flow_matching.path import AffineProbPath
-from flow_matching.solver import ODESolver
+
+# from flow_matching.path.scheduler import (
+#     CondOTScheduler,
+#     CosineScheduler,
+#     PolynomialConvexScheduler,
+#     VPScheduler,
+#     LinearVPScheduler,
+# )
+# from flow_matching.path import AffineProbPath
+# from flow_matching.solver import ODESolver
+from .transport import Transport, ModelType, PathType, WeightType, Sampler
 
 
 class ClassInstantier(OrderedDict):
@@ -176,6 +178,35 @@ class VelocityModel(nn.Module):
         return self.net(inputs)
 
 
+# class Flow(nn.Module):
+#     def __init__(self, cond_dim: int, out_dim: int, h: int):
+#         super().__init__()
+
+#         # Define MLP for velocity field
+#         self.velocity_model = VelocityModel(cond_dim, out_dim, h)
+
+#         # Flow matching components
+#         scheduler = CondOTScheduler()
+#         self.prob_path = AffineProbPath(scheduler=scheduler)
+#         self.solver = ODESolver(self.velocity_model)
+
+#     def compute_loss(
+#         self, x_0: torch.Tensor, x_1: torch.Tensor, cond: torch.Tensor
+#     ) -> torch.Tensor:
+#         """Compute flow matching loss."""
+#         # Sample time uniformly
+#         t = torch.rand(x_0.shape[0], x_0.shape[1], device=x_0.device)
+
+#         # Get path sample from probability path with scheduler outputs
+#         path_sample = self.prob_path.sample(t=t, x_0=x_0, x_1=x_1)
+
+#         # Get velocity field prediction
+#         v_t = self.velocity_model(path_sample.x_t, path_sample.t, cond)
+
+#         # Flow matching loss
+#         return F.mse_loss(v_t, path_sample.dx_t)
+
+
 class Flow(nn.Module):
     def __init__(self, cond_dim: int, out_dim: int, h: int):
         super().__init__()
@@ -183,26 +214,125 @@ class Flow(nn.Module):
         # Define MLP for velocity field
         self.velocity_model = VelocityModel(cond_dim, out_dim, h)
 
-        # Flow matching components
-        scheduler = CondOTScheduler()
-        self.prob_path = AffineProbPath(scheduler=scheduler)
-        self.solver = ODESolver(self.velocity_model)
+        # Create transport object with velocity model type and linear path
+        self.transport = Transport(
+            model_type=ModelType.VELOCITY,
+            path_type=PathType.LINEAR,
+            loss_type=WeightType.NONE,
+            train_eps=0.0,
+            sample_eps=0.0,
+        )
+
+        # Create sampler for generating samples
+        self.sampler = Sampler(self.transport)
 
     def compute_loss(
         self, x_0: torch.Tensor, x_1: torch.Tensor, cond: torch.Tensor
     ) -> torch.Tensor:
         """Compute flow matching loss."""
-        # Sample time uniformly
-        t = torch.rand(x_0.shape[0], x_0.shape[1], device=x_0.device)
+        # Use transport training loss
+        terms = self.transport.training_losses(
+            model=self.velocity_model,
+            x1=x_1,
+            model_kwargs={"cond": cond},
+        )
+        return terms["loss"].mean()
 
-        # Get path sample from probability path with scheduler outputs
-        path_sample = self.prob_path.sample(t=t, x_0=x_0, x_1=x_1)
+    
+    # def sample(
+    #     self,
+    #     x_init: torch.Tensor,
+    #     cond: torch.Tensor,
+    #     method: str = "dopri5",
+    #     step_size: float = 0.05,
+    #     return_intermediates: bool = False,
+    #     time_grid: Optional[torch.Tensor] = None,
+    # ) -> torch.Tensor:
+    #     """
+    #     Generate samples using the ODE solver.
+        
+    #     Args:
+    #         x_init: Initial noise tensor
+    #         cond: Conditioning tensor
+    #         method: ODE solver method ('dopri5', 'euler', 'heun', etc.)
+    #         step_size: Step size for fixed-step solvers
+    #         return_intermediates: Whether to return intermediate states
+    #         time_grid: Optional time points for sampling. If None, uses default grid
+        
+    #     Returns:
+    #         Generated samples
+    #     """
+    #     if time_grid is None:
+    #         time_grid = torch.linspace(0, 1.0, int(1.0/step_size) + 1, device=x_init.device)
+            
+    #     # Get ODE sampler with specified method
+    #     ode_sampler = self.sampler.sample_ode(
+    #         sampling_method=method,
+    #         num_steps=len(time_grid) if method in ['euler', 'heun'] else 50,
+    #         atol=1e-5,
+    #         rtol=1e-5,
+    #     )
+        
+    #     # Sample using the velocity model
+    #     samples = ode_sampler(
+    #         x_init,
+    #         model=self.velocity_model,
+    #         cond=cond,
+    #     )
+        
+    #     if return_intermediates:
+    #         return samples
+    #     return samples[-1]  # Return only final state if intermediates not requested
 
-        # Get velocity field prediction
-        v_t = self.velocity_model(path_sample.x_t, path_sample.t, cond)
-
-        # Flow matching loss
-        return F.mse_loss(v_t, path_sample.dx_t)
+    def sample(
+        self,
+        x_init: torch.Tensor,
+        cond: torch.Tensor,
+        method: str = "Euler",
+        step_size: float = 0.05,
+        return_intermediates: bool = False,
+        time_grid: Optional[torch.Tensor] = None,
+        diffusion_form: str = "linear",
+        diffusion_norm: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Generate samples using the SDE solver.
+        
+        Args:
+            x_init: Initial noise tensor
+            cond: Conditioning tensor
+            method: SDE solver method ('Euler', 'Heun')
+            step_size: Step size for fixed-step solvers
+            return_intermediates: Whether to return intermediate states
+            time_grid: Optional time points for sampling. If None, uses default grid
+            diffusion_form: Form of diffusion coefficient ('linear', 'constant', 'SBDM', etc.)
+            diffusion_norm: Scale of the diffusion coefficient
+        
+        Returns:
+            Generated samples
+        """
+        num_steps = int(1.0/step_size) + 1 if time_grid is None else len(time_grid)
+        
+        # Get SDE sampler with specified method
+        sde_sampler = self.sampler.sample_sde(
+            sampling_method=method,
+            diffusion_form=diffusion_form,
+            diffusion_norm=diffusion_norm,
+            last_step="Mean",  # Use mean for last step correction
+            last_step_size=step_size,
+            num_steps=num_steps,
+        )
+        
+        # Sample using the velocity model
+        samples = sde_sampler(
+            x_init,
+            model=lambda x, t, **kwargs: self.velocity_model(x, t, kwargs["cond"]),
+            cond=cond
+        )
+        
+        if return_intermediates:
+            return samples
+        return samples[-1]  # Return only final state if intermediates not requested
 
 
 class SegDiffModel(nn.Module):
@@ -439,23 +569,20 @@ class SegDiffModel(nn.Module):
             device=past_target.device,
         )
 
-        # Setup time steps for flow
-
         time_grid = torch.linspace(0, 1.0, self.n_steps + 1, device=x.device)
-
         # Get last decoder output and repeat for parallel samples
         last_cond = flow_cond[:, -1, :].repeat_interleave(
             num_parallel_samples, dim=0
         )
 
         # Evolve the samples through time using the flow
-        x = self.flow.solver.sample(
-            time_grid=time_grid,
+        x = self.flow.sample(
             x_init=x,
-            method="midpoint",
+            cond=last_cond,
+            method="Heun",
             step_size=0.05,
             return_intermediates=False,
-            cond=last_cond,
+            time_grid=time_grid
         )
 
         # Reshape and scale the samples
@@ -522,13 +649,13 @@ class SegDiffModel(nn.Module):
             #         t_end=time_steps[i + 1],
             #         cond=last_cond,
             #     )
-            x = self.flow.solver.sample(
-                time_grid=time_grid,
+            x = self.flow.sample(
                 x_init=x,
-                method="midpoint",
+                cond=last_cond,
+                method="Heun",
                 step_size=0.05,
                 return_intermediates=False,
-                cond=last_cond,
+                time_grid=time_grid
             )
 
             # Scale and store the samples
