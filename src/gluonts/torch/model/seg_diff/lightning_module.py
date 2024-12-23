@@ -80,14 +80,14 @@ class SegDiffLightningModule(pl.LightningModule):
         """
         Execute validation step.
         """
-        val_loss = self.model.loss(
+        val_loss = self.model.log_prob(
             **select(self.inputs, batch),
             future_target=batch["future_target"],
             future_observed_values=batch["future_observed_values"],
         ).mean()
 
         self.log(
-            "val_loss", val_loss, on_epoch=True, on_step=False, prog_bar=True
+            "val_loss", val_loss, on_epoch=True, on_step=True, prog_bar=True
         )
         return val_loss
 
