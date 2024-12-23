@@ -34,7 +34,6 @@ from gluonts.transform import (
 )
 from gluonts.torch.model.estimator import PyTorchLightningEstimator
 from gluonts.torch.model.predictor import PyTorchPredictor
-from gluonts.torch.distributions import Output, StudentTOutput
 
 from .lightning_module import SegDiffLightningModule
 
