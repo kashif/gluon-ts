@@ -56,25 +56,33 @@ class Patch(nn.Module):
         self.patch_stride = patch_stride
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        length = x.shape[-1]
+        # Ensure input is at least 3D
+        if x.ndim == 1:
+            x = x.unsqueeze(0).unsqueeze(-1)  # [L] -> [1, L, 1]
+        elif x.ndim == 2:
+            x = x.unsqueeze(-1)  # [B, L] -> [B, L, 1]
 
-        if length % self.patch_size != 0:
-            padding_size = (
-                *x.shape[:-1],
-                self.patch_size - (length % self.patch_size),
-            )
+        batch_size, seq_len, feat_dim = x.shape
+
+        # Handle padding if needed
+        if seq_len % self.patch_size != 0:
+            padding_size = self.patch_size - (seq_len % self.patch_size)
             padding = torch.full(
-                size=padding_size,
+                size=(batch_size, padding_size, feat_dim),
                 fill_value=torch.nan,
                 dtype=x.dtype,
                 device=x.device,
             )
-            x = torch.concat((padding, x), dim=-1)
+            x = torch.cat((padding, x), dim=1)
+            seq_len = x.shape[1]
 
+        # Unfold along sequence dimension
         x = x.unfold(
-            dimension=-1, size=self.patch_size, step=self.patch_stride
-        )
-        return x
+            dimension=1, size=self.patch_size, step=self.patch_stride
+        )  # [B, num_patches, patch_size, Feature]
+
+        # Reshape to [B, num_patches, patch_size * Feature]
+        return x.reshape(batch_size, -1, self.patch_size * feat_dim)
 
 
 class ResidualBlock(nn.Module):
@@ -531,15 +539,15 @@ class SegDiffModel(nn.Module):
             )
 
         # scale the input
-        past_target_scaled, loc, scale = self.scaler(
+        target_scaled, loc, scale = self.scaler(
             past_target, past_observed_values
         )
-        patched_past_target = self.patch(past_target_scaled)
+        patched_target = self.patch(target_scaled)
 
         # do patching for time features as well
-        if self.num_feat_dynamic_real > 0:
-            time_feat = torch.cat((past_time_feat, future_time_feat), dim=1)
-            patched_time_feat = self.patch(time_feat)
+        # if self.num_feat_dynamic_real > 0:
+        #     time_feat = torch.cat((past_time_feat, future_time_feat), dim=1)
+        #     patched_time_feat = self.patch(time_feat)
 
         # add loc and scale to past_target_patches as additional features
         log_abs_loc = loc.sign() * loc.abs().log1p()
@@ -548,14 +556,32 @@ class SegDiffModel(nn.Module):
         expanded_static_feat = unsqueeze_expand(
             torch.cat([log_abs_loc, log_scale], dim=-1),
             dim=1,
-            size=patched_past_target.shape[1],
+            size=patched_target.shape[1],
         )
-        inputs = torch.cat((patched_past_target, expanded_static_feat), dim=-1)
+        inputs = torch.cat((patched_target, expanded_static_feat), dim=-1)
 
-        if self.num_feat_dynamic_real > 0:
-            inputs = torch.cat((inputs, patched_time_feat), dim=-1)
+        if future_time_feat is not None:
+            past_time_feat = torch.cat(
+                (past_time_feat, future_time_feat), dim=1
+            )
+        patched_time_feat = self.patch(past_time_feat)[:, 1:, :]
+
+        if future_target is not None:
+            # shift the time featur patches by one and pad the very last patch with zeros:
+            patched_time_feat = torch.cat(
+                (
+                    patched_time_feat,
+                    torch.zeros_like(patched_time_feat[:, -1, :]).unsqueeze(1),
+                ),
+                dim=1,
+            )
+
+        # if self.num_feat_dynamic_real > 0:
+        #     inputs = torch.cat((inputs, patched_time_feat), dim=-1)
         # project the input embeddings to the model dimension
-        input_embeddings = self.input_patch_embedding(inputs)
+        input_embeddings = self.input_patch_embedding(
+            torch.cat((inputs, patched_time_feat), dim=-1)
+        )
 
         # causal mask for the transformer decoder
         mask = nn.Transformer.generate_square_subsequent_mask(
@@ -580,11 +606,12 @@ class SegDiffModel(nn.Module):
         flow_cond, loc, scale = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
-            past_time_feat=past_time_feat,
-            future_time_feat=future_time_feat,
             future_target=future_target,
             future_observed_values=future_observed_values,
+            past_time_feat=past_time_feat,
+            future_time_feat=future_time_feat,
         )
+
         # Get patches for target
         target = self.patch(
             (torch.cat((past_target, future_target), dim=1) - loc) / scale
@@ -593,7 +620,7 @@ class SegDiffModel(nn.Module):
         # Flow matching loss
         x_1 = target[:, 1:, :]  # Target patches
         x_0 = torch.randn_like(x_1)  # Random noise source distribution
-        # x_0 = target[:, :-1, :]
+        # x_0 = target[:, :-1, :] + torch.randn_like(target[:, :-1, :]) * 0.7
 
         return self.flow.compute_loss(
             x_1=x_1, x_0=x_0, cond=flow_cond[:, :-1, :]
@@ -667,6 +694,9 @@ class SegDiffModel(nn.Module):
             past_target=past_target,
             past_observed_values=past_observed_values,
             past_time_feat=past_time_feat,
+            future_time_feat=future_time_feat[:, : self.patch_len]
+            if future_time_feat is not None
+            else None,
         )
 
         # Initialize samples for each batch
@@ -678,6 +708,10 @@ class SegDiffModel(nn.Module):
             self.patch_len,
             device=past_target.device,
         )
+        # add it to the very last patch of past_target of size self.patch_len
+        # x = x + (
+        #     (past_target[:, -self.patch_len :] - loc) / scale
+        # ).repeat_interleave(num_parallel_samples, dim=0)
 
         # # the very last patch from past_target
         # x = (
@@ -735,6 +769,15 @@ class SegDiffModel(nn.Module):
             future_samples_flat = future_samples_flat.view(
                 batch_size * num_parallel_samples, -1
             )
+            # Calculate the current offset for future_time_feat
+            time_feat_offset = min(
+                total_samples + self.patch_len, self.prediction_length
+            )
+            current_future_time_feat = (
+                repeat_future_time_feat[:, total_samples:time_feat_offset]
+                if future_time_feat is not None
+                else None
+            )
 
             flow_cond, loc, scale = self.params_from_decoder_output(
                 past_target=repeat_past_target,
@@ -744,9 +787,7 @@ class SegDiffModel(nn.Module):
                 else None,
                 future_target=future_samples_flat,
                 future_observed_values=torch.ones_like(future_samples_flat),
-                future_time_feat=repeat_future_time_feat
-                if future_time_feat is not None
-                else None,
+                future_time_feat=current_future_time_feat,
             )
 
             # Sample new noise for next patch

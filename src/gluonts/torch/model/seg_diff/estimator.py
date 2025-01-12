@@ -21,6 +21,7 @@ from gluonts.dataset.common import Dataset
 from gluonts.dataset.field_names import FieldName
 from gluonts.dataset.loader import as_stacked_batches
 from gluonts.itertools import Cyclic
+from gluonts.time_feature import time_features_from_frequency_str
 from gluonts.transform import (
     Transformation,
     AddObservedValuesIndicator,
@@ -30,18 +31,25 @@ from gluonts.transform import (
     TestSplitSampler,
     ExpectedNumInstanceSampler,
     SelectFields,
-    RenameFields,
+    AddTimeFeatures,
+    AddAgeFeature,
+    VstackFeatures,
 )
 from gluonts.torch.model.estimator import PyTorchLightningEstimator
 from gluonts.torch.model.predictor import PyTorchPredictor
 
 from .lightning_module import SegDiffLightningModule
 
-PREDICTION_INPUT_NAMES = ["past_target", "past_observed_values"]
+PREDICTION_INPUT_NAMES = [
+    f"past_{FieldName.TARGET}",
+    f"past_{FieldName.OBSERVED_VALUES}",
+    f"past_{FieldName.FEAT_TIME}",
+    f"future_{FieldName.FEAT_TIME}",
+]
 
 TRAINING_INPUT_NAMES = PREDICTION_INPUT_NAMES + [
-    "future_target",
-    "future_observed_values",
+    f"future_{FieldName.TARGET}",
+    f"future_{FieldName.OBSERVED_VALUES}",
 ]
 
 
@@ -163,6 +171,8 @@ class SegDiffEstimator(PyTorchLightningEstimator):
             min_future=self.prediction_length
         )
 
+        self.time_features = time_features_from_frequency_str("s")
+
     def create_transformation(self) -> Transformation:
         return (
             SelectFields(
@@ -179,10 +189,31 @@ class SegDiffEstimator(PyTorchLightningEstimator):
                 ),
                 allow_missing=True,
             )
-            + RenameFields({FieldName.FEAT_DYNAMIC_REAL: FieldName.FEAT_TIME})
+            + AddTimeFeatures(
+                start_field=FieldName.START,
+                target_field=FieldName.TARGET,
+                output_field=FieldName.FEAT_TIME,
+                time_features=self.time_features,
+                pred_length=self.prediction_length,
+            )
+            + AddAgeFeature(
+                target_field=FieldName.TARGET,
+                output_field=FieldName.FEAT_AGE,
+                pred_length=self.prediction_length,
+                log_scale=True,
+            )
             + AddObservedValuesIndicator(
                 target_field=FieldName.TARGET,
                 output_field=FieldName.OBSERVED_VALUES,
+            )
+            + VstackFeatures(
+                output_field=FieldName.FEAT_TIME,
+                input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]
+                + (
+                    [FieldName.FEAT_DYNAMIC_REAL]
+                    if self.num_feat_dynamic_real > 0
+                    else []
+                ),
             )
         )
 
@@ -197,14 +228,15 @@ class SegDiffEstimator(PyTorchLightningEstimator):
                 "d_model": self.d_model,
                 "nhead": self.nhead,
                 "dim_feedforward": self.dim_feedforward,
-                "num_feat_dynamic_real": self.num_feat_dynamic_real,
                 "dropout": self.dropout,
                 "activation": self.activation,
                 "norm_first": self.norm_first,
                 "num_decoder_layers": self.num_decoder_layers,
-                # "distr_output": self.distr_output,
                 "scaling": self.scaling,
                 "n_steps": self.n_steps,
+                "num_feat_dynamic_real": len(self.time_features)
+                + 1
+                + self.num_feat_dynamic_real,
             },
         )
 
@@ -227,10 +259,10 @@ class SegDiffEstimator(PyTorchLightningEstimator):
             instance_sampler=instance_sampler,
             past_length=self.context_length,
             future_length=self.prediction_length,
-            time_series_fields=[FieldName.OBSERVED_VALUES]
-            + (
-                [FieldName.FEAT_TIME] if self.num_feat_dynamic_real > 0 else []
-            ),
+            time_series_fields=[
+                FieldName.FEAT_TIME,
+                FieldName.OBSERVED_VALUES,
+            ],
         )
 
     def create_training_data_loader(
@@ -248,15 +280,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
             instances,
             batch_size=self.batch_size,
             shuffle_buffer_length=shuffle_buffer_length,
-            field_names=TRAINING_INPUT_NAMES
-            + (
-                [
-                    f"past_{FieldName.FEAT_TIME}",
-                    f"future_{FieldName.FEAT_TIME}",
-                ]
-                if self.num_feat_dynamic_real > 0
-                else []
-            ),
+            field_names=TRAINING_INPUT_NAMES,
             output_type=torch.tensor,
             num_batches_per_epoch=self.num_batches_per_epoch,
         )
@@ -270,15 +294,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
         return as_stacked_batches(
             instances,
             batch_size=self.batch_size,
-            field_names=TRAINING_INPUT_NAMES
-            + (
-                [
-                    f"past_{FieldName.FEAT_TIME}",
-                    f"future_{FieldName.FEAT_TIME}",
-                ]
-                if self.num_feat_dynamic_real > 0
-                else []
-            ),
+            field_names=TRAINING_INPUT_NAMES,
             output_type=torch.tensor,
         )
 
@@ -289,15 +305,7 @@ class SegDiffEstimator(PyTorchLightningEstimator):
 
         return PyTorchPredictor(
             input_transform=transformation + prediction_splitter,
-            input_names=PREDICTION_INPUT_NAMES
-            + (
-                [
-                    f"past_{FieldName.FEAT_TIME}",
-                    f"future_{FieldName.FEAT_TIME}",
-                ]
-                if self.num_feat_dynamic_real > 0
-                else []
-            ),
+            input_names=PREDICTION_INPUT_NAMES,
             prediction_net=module,
             batch_size=self.batch_size,
             prediction_length=self.prediction_length,
