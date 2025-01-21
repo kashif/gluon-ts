@@ -22,7 +22,7 @@ from torch.distributions import Independent, Normal
 from gluonts.core.component import validated
 from gluonts.model import Input, InputSpec
 from gluonts.torch.scaler import StdScaler, MeanScaler, NOPScaler
-from gluonts.torch.util import unsqueeze_expand
+# from gluonts.torch.util import unsqueeze_expand
 
 from flow_matching.path import CondOTProbPath
 from flow_matching.solver import ODESolver
