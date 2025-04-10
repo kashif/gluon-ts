@@ -603,7 +603,7 @@ class TTTCache:
 
     """
 
-    def __init__(self, model, batch_size: int):
+    def __init__(self, model, batch_size: int, device: torch.device):
         config = model.config
         self.seqlen_offset = 0
         self.mini_batch_size = config.mini_batch_size
@@ -627,7 +627,7 @@ class TTTCache:
                 )
                 tiled_weight = torch.tile(
                     weight.unsqueeze(0), (batch_size,) + (1,) * weight.dim()
-                ).to(model.device)
+                ).to(device)
                 self.ttt_params_dict[f"{name}_states"][layer_idx] = (
                     tiled_weight
                 )
@@ -641,20 +641,20 @@ class TTTCache:
                     batch_size,
                     config.hidden_size,
                     config.conv_kernel,
-                    device=model.device,
+                    device=device,
                 )
             if config.share_qk:
                 self.conv_states_dic["ttt_conv_q"][layer_idx] = torch.zeros(
                     batch_size,
                     config.hidden_size,
                     config.conv_kernel,
-                    device=model.device,
+                    device=device,
                 )
                 self.conv_states_dic["ttt_conv_k"][layer_idx] = torch.zeros(
                     batch_size,
                     config.hidden_size,
                     config.conv_kernel,
-                    device=model.device,
+                    device=device,
                 )
 
     def update(self, py_tree, layer_idx, seq_len):
@@ -1807,7 +1807,7 @@ class TTTModel(TTTPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if cache_params is None and use_cache:
-            cache_params = TTTCache(self, inputs_embeds.size(0))
+            cache_params = TTTCache(self, inputs_embeds.size(0), device=inputs_embeds.device)
 
         seqlen_offset = 0
         if cache_params is not None:

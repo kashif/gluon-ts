@@ -27,6 +27,7 @@ from gluonts.torch.scaler import StdScaler, MeanScaler, NOPScaler
 from flow_matching.path import CondOTProbPath
 from flow_matching.solver import ODESolver
 # from .transport import Transport, ModelType, PathType, WeightType, Sampler
+from .ttt import Block, TTTConfig, TTTCache
 
 
 class ClassInstantier(OrderedDict):
@@ -462,21 +463,35 @@ class SegDiffModel(nn.Module):
             dropout_p=dropout_rate,
         )
 
-        layer_norm_eps: float = 1e-5
-        decoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            layer_norm_eps=layer_norm_eps,
-            batch_first=True,
-            norm_first=norm_first,
-        )
-        decoder_norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        # layer_norm_eps: float = 1e-5
+        # decoder_layer = nn.TransformerEncoderLayer(
+        #     d_model=d_model,
+        #     nhead=nhead,
+        #     dim_feedforward=dim_feedforward,
+        #     dropout=dropout,
+        #     activation="gelu",
+        #     layer_norm_eps=layer_norm_eps,
+        #     batch_first=True,
+        #     norm_first=norm_first,
+        # )
+        # decoder_norm = nn.LayerNorm(d_model, eps=layer_norm_eps)
 
-        self.decoder = nn.TransformerEncoder(
-            decoder_layer, num_decoder_layers, decoder_norm
+        # self.decoder = nn.TransformerEncoder(
+        #     decoder_layer, num_decoder_layers, decoder_norm
+        # )
+        self.config = TTTConfig(
+            hidden_size=d_model,
+            num_attention_heads=nhead,
+            intermediate_size=dim_feedforward,
+            num_hidden_layers=num_decoder_layers,
+            hidden_act=activation,
+            ttt_layer_type="mlp",
+        )
+        self.layers = nn.ModuleList(
+            [
+                Block(self.config, layer_idx)
+                for layer_idx in range(num_decoder_layers)
+            ]
         )
 
         self.flow = Flow(
@@ -530,7 +545,8 @@ class SegDiffModel(nn.Module):
         future_observed_values: Optional[torch.Tensor] = None,
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_params: Optional[TTTCache] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if future_target is not None and future_observed_values is not None:
             past_target = torch.cat((past_target, future_target), dim=1)
             past_observed_values = torch.cat(
@@ -589,11 +605,21 @@ class SegDiffModel(nn.Module):
             input_embeddings.shape[1], device=input_embeddings.device
         )
         # transformer encoder with positional encoding
-        dec_out = self.decoder(input_embeddings, is_causal=True, mask=mask)
+        hidden_states = input_embeddings
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=mask,
+                position_ids=torch.arange(
+                    input_embeddings.shape[1], device=input_embeddings.device
+                ).unsqueeze(0),
+                cache_params=cache_params,
+            )
+        # dec_out = self.decoder(input_embeddings, is_causal=True, mask=mask)
 
         # # Project decoder output to condition the flow
         # flow_cond = self.proj(dec_out)
-        return dec_out, target_scaled, loc, scale
+        return hidden_states, target_scaled, loc, scale, cache_params
 
     def loss(
         self,
@@ -604,7 +630,7 @@ class SegDiffModel(nn.Module):
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        flow_cond, target_scaled, _, _ = self.params_from_decoder_output(
+        flow_cond, target_scaled, _, _, _ = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
             future_target=future_target,
@@ -652,7 +678,7 @@ class SegDiffModel(nn.Module):
             1,
         ).log_prob
 
-        flow_cond, target_scaled, loc, scale = self.params_from_decoder_output(
+        flow_cond, target_scaled, loc, scale, _ = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
             past_time_feat=past_time_feat,
@@ -689,18 +715,24 @@ class SegDiffModel(nn.Module):
         past_time_feat: Optional[torch.Tensor] = None,
         future_time_feat: Optional[torch.Tensor] = None,
         num_parallel_samples: Optional[int] = None,
+        cache_params: Optional[TTTCache] = None,
     ):
         if num_parallel_samples is None:
             num_parallel_samples = self.num_parallel_samples
 
+        # Initialize TTTCache if not provided
+        if cache_params is None:
+            cache_params = TTTCache(self, batch_size=past_target.shape[0], device=past_target.device)
+
         # Get initial flow conditioning from decoder
-        flow_cond, _, past_loc, past_scale = self.params_from_decoder_output(
+        flow_cond, _, past_loc, past_scale, cache_params = self.params_from_decoder_output(
             past_target=past_target,
             past_observed_values=past_observed_values,
             past_time_feat=past_time_feat,
             future_time_feat=future_time_feat[:, : self.patch_len]
             if future_time_feat is not None
             else None,
+            cache_params=cache_params,
         )
         loc = past_loc[:, -1, :]
         scale = past_scale[:, -1, :]
@@ -785,7 +817,10 @@ class SegDiffModel(nn.Module):
                 else None
             )
 
-            flow_cond, _, _, _ = self.params_from_decoder_output(
+            # Update the cache sequence length offset for the next autoregressive step
+            cache_params.seqlen_offset += future_samples_flat.shape[1] // self.patch_len
+
+            flow_cond, _, _, _, cache_params = self.params_from_decoder_output(
                 past_target=repeat_past_target,
                 past_observed_values=repeat_past_observed_values,
                 past_time_feat=repeat_past_time_feat
@@ -794,6 +829,7 @@ class SegDiffModel(nn.Module):
                 future_target=future_samples_flat,
                 future_observed_values=torch.ones_like(future_samples_flat),
                 future_time_feat=current_future_time_feat,
+                cache_params=cache_params,
             )
 
             # Sample new source sample for next patch
